@@ -7,8 +7,8 @@ from parameters import *
 import os
 import tensorflow as tf
 print(tf.__version__)
-print(tf.config.list_physical_devices('GPU'))  # should show a GPU if configured
-from tensorflow.keras.callbacks import EarlyStopping  # confirms callbacks available
+print(tf.config.list_physical_devices('GPU'))  
+from tensorflow.keras.callbacks import EarlyStopping 
 
 
 def plot_graph(test_df):
@@ -60,7 +60,6 @@ def get_final_df(model, data):
                                     final_df["adjclose"],
                                     final_df[f"adjclose_{LOOKUP_STEP}"],
                                     final_df[f"true_adjclose_{LOOKUP_STEP}"])
-                                    # since we don't have profit for last sequence, add 0's
                                     )
     return final_df
 def predict(model, data):
