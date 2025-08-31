@@ -8,98 +8,115 @@ from collections import deque
 from sklearn import preprocessing
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout, Bidirectional
-from tensorflow.keras.callbacks import ModelCheckpoint, TensorBoard
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Bidirectional, Input
+from tensorflow.keras.callbacks import ModelCheckpoint, TensorBoard, EarlyStopping, ReduceLROnPlateau
 import yfinance as yf
 import matplotlib.pyplot as plt
 
-# -----------------------------
-# Reproducibility
-# -----------------------------
 np.random.seed(314)
 tf.random.set_seed(314)
 random.seed(314)
 
-# -----------------------------
-# Hyperparams / Config
-# -----------------------------
-N_STEPS = 50                 # sequence length
-LOOKUP_STEP = 15             # predict N days into the future
+# Data / features
+N_STEPS = 50                  # sequence/window length
+LOOKUP_STEP = 15              # predict N days into the future
 SCALE = True
-SPLIT_BY_DATE = False
+SPLIT_BY_DATE = False         # True: split by time, False: random split
 SHUFFLE = True
 TEST_SIZE = 0.2
 FEATURE_COLUMNS = ["adjclose", "volume", "open", "high", "low"]
 
+# Model
 N_LAYERS = 2
 CELL = LSTM
 UNITS = 256
 DROPOUT = 0.4
 BIDIRECTIONAL = False
 
-LOSS = "huber_loss"          # or "mae"
+# Training
+LOSS = tf.keras.losses.Huber()     # Keras 3-compatible loss object
+LOSS_NAME = "huber"                # for file naming only
 OPTIMIZER = "adam"
 BATCH_SIZE = 64
 EPOCHS = 500
+ES_PATIENCE = 10
+LR_PATIENCE = 5
+LR_FACTOR = 0.5
 
-ticker = "AMZN"
-date_now = time.strftime("%Y-%m-%d")
-
-scale_str = f"sc-{int(SCALE)}"
-shuffle_str = f"sh-{int(SHUFFLE)}"
-split_by_date_str = f"sbd-{int(SPLIT_BY_DATE)}"
-
-model_name = (
-    f"{date_now}_{ticker}-{shuffle_str}-{scale_str}-{split_by_date_str}-"
-    f"{LOSS}-{OPTIMIZER}-{CELL.__name__}-seq-{N_STEPS}-step-{LOOKUP_STEP}-"
-    f"layers-{N_LAYERS}-units-{UNITS}"
-)
-if BIDIRECTIONAL:
-    model_name += "-b"
+# Data range & cache
+TICKER = "AAPL"
+START_DATE = "2018-01-01"          # or None
+END_DATE = None                    # e.g., "2025-08-01" or None for today
+PERIOD = None                      # alternative to dates, e.g. "10y"
+NA_STRATEGY = "ffill_bfill"        # "drop" or "ffill_bfill"
+INTERVAL = "1d"
 
 # Paths
+DATE_NOW = time.strftime("%Y-%m-%d")
 RESULTS_DIR = "results"
 LOGS_DIR = "logs"
 DATA_DIR = "data"
 CSV_RESULTS_DIR = "csv-results"
-
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(LOGS_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(CSV_RESULTS_DIR, exist_ok=True)
 
-ticker_data_filename = os.path.join(DATA_DIR, f"{ticker}_{date_now}.csv")
+if START_DATE or END_DATE:
+    CACHE_NAME = f"{TICKER}_{START_DATE or 'NA'}_{END_DATE or 'NA'}.csv"
+else:
+    CACHE_NAME = f"{TICKER}_{PERIOD or '10y'}.csv"
+CACHE_PATH = os.path.join(DATA_DIR, CACHE_NAME)
 
+scale_str = f"sc-{int(SCALE)}"
+shuffle_str = f"sh-{int(SHUFFLE)}"
+split_by_date_str = f"sbd-{int(SPLIT_BY_DATE)}"
 
-# -----------------------------
-# Utils
-# -----------------------------
+MODEL_NAME = (
+    f"{DATE_NOW}_{TICKER}-{shuffle_str}-{scale_str}-{split_by_date_str}-"
+    f"{LOSS_NAME}-{OPTIMIZER}-{CELL.__name__}-seq-{N_STEPS}-step-{LOOKUP_STEP}-"
+    f"layers-{N_LAYERS}-units-{UNITS}" + ("-b" if BIDIRECTIONAL else "")
+)
+
 def shuffle_in_unison(a, b):
     state = np.random.get_state()
     np.random.shuffle(a)
     np.random.set_state(state)
     np.random.shuffle(b)
 
-
-def _download_prices_yf(ticker: str, period="10y", interval="1d") -> pd.DataFrame:
-    """
-    Download OHLCV from Yahoo via yfinance and return a single-level,
-    lowercase/space-free column set: open, high, low, close, adjclose, volume
-    """
-    df = yf.download(
-        ticker,
-        period=period,
-        interval=interval,
-        auto_adjust=False,
-        progress=False,
-    )
+def _download_prices_yf(
+    ticker: str,
+    start_date: str = None,   # "YYYY-MM-DD"
+    end_date: str = None,     # "YYYY-MM-DD"
+    period: str = None,       # e.g. "10y"
+    interval: str = "1d",
+    cache_path: str = None,
+    use_local: bool = True
+) -> pd.DataFrame:
+    # 1) Try local cache
+    if use_local and cache_path and os.path.isfile(cache_path):
+        df = pd.read_csv(cache_path, index_col=0)
+        # ensure datetime index
+        df.index = pd.to_datetime(df.index, errors="coerce")
+        df = df[~df.index.isna()]
+    else:
+        # 2) Download with yfinance using either start/end or period
+        if start_date or end_date:
+            df = yf.download(
+                ticker, start=start_date, end=end_date,
+                interval=interval, auto_adjust=False, progress=False
+            )
+        else:
+            df = yf.download(
+                ticker, period=(period or "10y"),
+                interval=interval, auto_adjust=False, progress=False
+            )
 
     if df is None or df.empty:
-        raise RuntimeError(f"No data returned by yfinance for {ticker}. Try another ticker or longer period.")
+        raise RuntimeError(f"No data returned by yfinance for {ticker}. Check ticker/date/period.")
 
-    # If yfinance returned a MultiIndex (e.g., ('Adj Close','AAPL')), collapse it.
+    # If yfinance returned a MultiIndex (e.g., ('Adj Close','AAPL')), collapse it
     if isinstance(df.columns, pd.MultiIndex):
-        # choose the level that looks like field names (Open/High/Low/Close/Adj Close/Volume)
         fields = {"Open", "High", "Low", "Close", "Adj Close", "Volume"}
         lev0 = [c[0] for c in df.columns]
         lev1 = [c[1] for c in df.columns]
@@ -116,20 +133,21 @@ def _download_prices_yf(ticker: str, period="10y", interval="1d") -> pd.DataFram
         if "close" in df.columns:
             df["adjclose"] = df["close"]
         else:
-            raise RuntimeError("Neither 'Adj Close' nor 'Close' available in yfinance data.")
+            raise RuntimeError("Neither 'Adj Close' nor 'Close' present in data.")
 
     needed = {"open", "high", "low", "adjclose", "volume"}
     missing = needed - set(df.columns)
     if missing:
-        raise RuntimeError(f"Missing required columns in downloaded data: {missing}")
+        raise RuntimeError(f"Missing required columns: {missing}")
 
-    # Drop NaNs on required columns
-    df = df.dropna(subset=list(needed))
+    # Save cache (post-normalization) if requested
+    if cache_path:
+        df.to_csv(cache_path)
 
-    # Make sure index is DatetimeIndex
+    # Ensure DatetimeIndex
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index, errors="coerce")
-        df = df.dropna(axis=0, subset=[df.index.name])
+        df = df[~df.index.isna()]
 
     return df
 
@@ -142,36 +160,52 @@ def load_data(
     split_by_date=True,
     test_size=0.2,
     feature_columns=("adjclose", "volume", "open", "high", "low"),
+    start_date: str = None,
+    end_date: str = None,
+    period: str = None,
+    cache_path: str = None,
+    use_local: bool = True,
+    na_strategy: str = "drop"  # "drop" | "ffill_bfill"
 ):
-    """
-    Loads data via yfinance, normalizes, scales (optional), builds sequences,
-    and returns dict with train/test splits, scalers, original df, etc.
-    """
     # 1) Load
     if isinstance(ticker, str):
-        df = _download_prices_yf(ticker)
+        df = _download_prices_yf(
+            ticker,
+            start_date=start_date,
+            end_date=end_date,
+            period=period,
+            interval=INTERVAL,
+            cache_path=cache_path,
+            use_local=use_local
+        )
     elif isinstance(ticker, pd.DataFrame):
         df = ticker.copy()
-        # Ensure normalized column names
         df.columns = [c.lower().replace(" ", "") for c in df.columns]
         if "adjclose" not in df.columns and "close" in df.columns:
             df["adjclose"] = df["close"]
     else:
-        raise TypeError("ticker can be a str or a pd.DataFrame.")
+        raise TypeError("ticker must be str or pd.DataFrame")
 
-    # 2) Sanity on features
+    # 2) Feature sanity
     for col in feature_columns:
-        assert col in df.columns, f"'{col}' does not exist in the dataframe."
+        assert col in df.columns, f"'{col}' not in dataframe."
 
-    # 3) Add a date column from index if missing
+    # 3) NaN handling
+    if na_strategy.lower() == "ffill_bfill":
+        df = df.sort_index()
+        df[list(feature_columns)] = df[list(feature_columns)].ffill().bfill()
+    elif na_strategy.lower() == "drop":
+        df = df.dropna(subset=list(feature_columns))
+    else:
+        raise ValueError("na_strategy must be 'drop' or 'ffill_bfill'")
+
+    # 4) Date column
     if "date" not in df.columns:
         df["date"] = df.index
 
-    # 4) Optional scaling
-    result = {}
-    result["df"] = df.copy()
+    # 5) Scaling
+    result = {"df": df.copy()}
     column_scaler = {}
-
     if scale:
         for column in feature_columns:
             scaler = preprocessing.MinMaxScaler()
@@ -179,33 +213,28 @@ def load_data(
             column_scaler[column] = scaler
         result["column_scaler"] = column_scaler
 
-    # 5) Future/label column
+    # 6) Label (future)
     df["future"] = df["adjclose"].shift(-lookup_step)
-
-    # Keep the last `lookup_step` rows' features (before dropping NaNs)
     last_sequence_raw = np.array(df[list(feature_columns)].tail(lookup_step))
+    df = df.dropna(subset=["future"])
 
-    # Drop NaNs created by shift
-    df.dropna(inplace=True)
-
-    # 6) Build sequences
+    # 7) Build sequences
     sequence_data = []
-    sequences = deque(maxlen=n_steps)
+    window = deque(maxlen=n_steps)
+    for row, target in zip(df[list(feature_columns) + ["date"]].values, df["future"].values):
+        window.append(row)
+        if len(window) == n_steps:
+            sequence_data.append([np.array(window), target])
 
-    for entry, target in zip(df[list(feature_columns) + ["date"]].values, df["future"].values):
-        sequences.append(entry)
-        if len(sequences) == n_steps:
-            sequence_data.append([np.array(sequences), target])
+    if not sequence_data:
+        raise ValueError("Not enough data after processing! Lower n_steps/lookup_step or extend date range.")
 
-    # If not enough data after processing:
-    if len(sequence_data) == 0:
-        raise ValueError("Not enough data after processing! Try lowering n_steps or lookup_step.")
-
-    last_seq_features_only = [row[: len(feature_columns)] for row in list(sequences)]
-    last_sequence = np.array(last_seq_features_only + list(last_sequence_raw)).astype(np.float32)
+    # Last sequence for future inference
+    last_feats_only = [r[:len(feature_columns)] for r in list(window)]
+    last_sequence = np.array(last_feats_only + list(last_sequence_raw)).astype(np.float32)
     result["last_sequence"] = last_sequence
 
-    # 7) Split into X, y
+    # 8) Split X, y
     X, y = [], []
     for seq, target in sequence_data:
         X.append(seq)
@@ -213,38 +242,27 @@ def load_data(
     X = np.array(X)
     y = np.array(y)
 
-    # 8) Train/test split
     if split_by_date:
-        train_samples = int((1 - test_size) * len(X))
-        result["X_train"] = X[:train_samples]
-        result["y_train"] = y[:train_samples]
-        result["X_test"] = X[train_samples:]
-        result["y_test"] = y[train_samples:]
+        cut = int((1 - test_size) * len(X))
+        X_train, y_train = X[:cut], y[:cut]
+        X_test, y_test = X[cut:], y[cut:]
         if shuffle:
-            shuffle_in_unison(result["X_train"], result["y_train"])
-            shuffle_in_unison(result["X_test"], result["y_test"])
+            shuffle_in_unison(X_train, y_train)
+            shuffle_in_unison(X_test, y_test)
     else:
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, shuffle=shuffle
-        )
-        result["X_train"], result["X_test"], result["y_train"], result["y_test"] = (
-            X_train,
-            X_test,
-            y_train,
-            y_test,
-        )
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, shuffle=shuffle)
 
-    # 9) Build test_df from dates located in the last column of X_test
-    dates = result["X_test"][:, -1, -1]
+    # 9) Build test_df from dates in last column
+    dates = X_test[:, -1, -1]
     test_df = result["df"].loc[dates]
     test_df = test_df[~test_df.index.duplicated(keep="first")]
-    # Keep only features in X arrays (strip the date column)
-    result["X_train"] = result["X_train"][:, :, : len(feature_columns)].astype(np.float32)
-    result["X_test"] = result["X_test"][:, :, : len(feature_columns)].astype(np.float32)
-    result["test_df"] = test_df
 
+    # Strip the date column from tensors
+    X_train = X_train[:, :, :len(feature_columns)].astype(np.float32)
+    X_test = X_test[:, :, :len(feature_columns)].astype(np.float32)
+
+    result.update(dict(X_train=X_train, y_train=y_train, X_test=X_test, y_test=y_test, test_df=test_df))
     return result
-
 
 def create_model(
     sequence_length,
@@ -258,28 +276,19 @@ def create_model(
     bidirectional=False,
 ):
     model = Sequential()
+    model.add(Input(shape=(sequence_length, n_features)))  # explicit Input
+
     for i in range(n_layers):
         return_sequences = i < n_layers - 1
-        if i == 0:
-            if bidirectional:
-                model.add(
-                    Bidirectional(
-                        cell(units, return_sequences=return_sequences),
-                        input_shape=(sequence_length, n_features),
-                    )
-                )
-            else:
-                model.add(cell(units, return_sequences=return_sequences, input_shape=(sequence_length, n_features)))
+        if bidirectional:
+            model.add(Bidirectional(cell(units, return_sequences=return_sequences)))
         else:
-            if bidirectional:
-                model.add(Bidirectional(cell(units, return_sequences=return_sequences)))
-            else:
-                model.add(cell(units, return_sequences=return_sequences))
+            model.add(cell(units, return_sequences=return_sequences))
         model.add(Dropout(dropout))
+
     model.add(Dense(1, activation="linear"))
     model.compile(loss=loss, metrics=["mean_absolute_error"], optimizer=optimizer)
     return model
-
 
 def plot_graph(test_df, lookup_step):
     plt.plot(test_df[f"true_adjclose_{lookup_step}"])
@@ -288,7 +297,6 @@ def plot_graph(test_df, lookup_step):
     plt.ylabel("Price")
     plt.legend(["Actual Price", "Predicted Price"])
     plt.show()
-
 
 def get_final_df(model, data, scale=True, lookup_step=1):
     buy_profit = lambda current, pred_future, true_future: (true_future - current) if pred_future > current else 0
@@ -319,7 +327,6 @@ def get_final_df(model, data, scale=True, lookup_step=1):
     )
     return final_df
 
-
 def predict_future(model, data, n_steps, scale=True):
     last_sequence = data["last_sequence"][-n_steps:]
     last_sequence = np.expand_dims(last_sequence, axis=0)
@@ -330,14 +337,14 @@ def predict_future(model, data, n_steps, scale=True):
         predicted_price = prediction[0][0]
     return predicted_price
 
-
 # -----------------------------
 # Main
 # -----------------------------
 if __name__ == "__main__":
-    # Load data
+    print(f"Loading data for ticker: {TICKER}")
+
     data = load_data(
-        ticker,
+        TICKER,
         N_STEPS,
         scale=SCALE,
         split_by_date=SPLIT_BY_DATE,
@@ -345,10 +352,18 @@ if __name__ == "__main__":
         lookup_step=LOOKUP_STEP,
         test_size=TEST_SIZE,
         feature_columns=FEATURE_COLUMNS,
+        start_date=START_DATE,
+        end_date=END_DATE,
+        period=PERIOD,
+        cache_path=CACHE_PATH,
+        use_local=True,
+        na_strategy=NA_STRATEGY
     )
 
-    # Save raw df snapshot
-    data["df"].to_csv(ticker_data_filename)
+    # Save raw df snapshot for reference
+    raw_csv_path = os.path.join(DATA_DIR, f"{TICKER}_{DATE_NOW}.csv")
+    data["df"].to_csv(raw_csv_path)
+    print(f"Data snapshot saved to {raw_csv_path}")
 
     # Build model
     model = create_model(
@@ -363,11 +378,17 @@ if __name__ == "__main__":
         bidirectional=BIDIRECTIONAL,
     )
 
-    # Callbacks
+    # Callbacks (Keras 3: .weights.h5 for weights-only)
     checkpointer = ModelCheckpoint(
-        os.path.join(RESULTS_DIR, model_name + ".h5"), save_weights_only=True, save_best_only=True, verbose=1
+        os.path.join(RESULTS_DIR, MODEL_NAME + ".weights.h5"),
+        save_weights_only=True,
+        save_best_only=True,
+        monitor="val_loss",
+        verbose=1
     )
-    tensorboard = TensorBoard(log_dir=os.path.join(LOGS_DIR, model_name))
+    tensorboard = TensorBoard(log_dir=os.path.join(LOGS_DIR, MODEL_NAME))
+    early_stopping = EarlyStopping(monitor="val_loss", patience=ES_PATIENCE, restore_best_weights=True, verbose=1)
+    reduce_lr = ReduceLROnPlateau(monitor="val_loss", factor=LR_FACTOR, patience=LR_PATIENCE, verbose=1)
 
     # Train
     history = model.fit(
@@ -376,17 +397,17 @@ if __name__ == "__main__":
         batch_size=BATCH_SIZE,
         epochs=EPOCHS,
         validation_data=(data["X_test"], data["y_test"]),
-        callbacks=[checkpointer, tensorboard],
+        callbacks=[checkpointer, tensorboard, early_stopping, reduce_lr],
         verbose=1,
     )
 
-    # Load best weights
-    model_path = os.path.join(RESULTS_DIR, model_name) + ".h5"
-    if os.path.exists(model_path):
-        model.load_weights(model_path)
+    # Load best weights (if not already restored by EarlyStopping)
+    best_weights = os.path.join(RESULTS_DIR, MODEL_NAME + ".weights.h5")
+    if os.path.exists(best_weights):
+        model.load_weights(best_weights)
 
     # Evaluate
-    loss, mae = model.evaluate(data["X_test"], data["y_test"], verbose=0)
+    loss_val, mae = model.evaluate(data["X_test"], data["y_test"], verbose=0)
     if SCALE:
         mean_absolute_error = data["column_scaler"]["adjclose"].inverse_transform([[mae]])[0][0]
     else:
@@ -403,7 +424,7 @@ if __name__ == "__main__":
     profit_per_trade = total_profit / len(final_df)
 
     print(f"Future price after {LOOKUP_STEP} days is {future_price:.2f}$")
-    print(f"{LOSS} loss:", loss)
+    print(f"{LOSS_NAME} loss:", loss_val)
     print("Mean Absolute Error:", mean_absolute_error)
     print("Accuracy score:", accuracy_score)
     print("Total buy profit:", total_buy_profit)
@@ -411,10 +432,10 @@ if __name__ == "__main__":
     print("Total profit:", total_profit)
     print("Profit per trade:", profit_per_trade)
 
-    # Plot
+    # Plot Actual vs Predicted
     plot_graph(final_df, LOOKUP_STEP)
 
-    # Save final csv
-    csv_filename = os.path.join(CSV_RESULTS_DIR, model_name + ".csv")
+    # Save final CSV
+    csv_filename = os.path.join(CSV_RESULTS_DIR, MODEL_NAME + ".csv")
     final_df.to_csv(csv_filename, index=True)
     print(f"Saved final results to {csv_filename}")
