@@ -68,7 +68,7 @@ ticker_data_filename = os.path.join(DATA_DIR, f"{ticker}_{date_now}.csv")
 # Model name (unique based on parameters)
 model_name = (
     f"{date_now}_{ticker}-{shuffle_str}-{scale_str}-{split_by_date_str}-"
-    f"{LOSS}-{OPTIMIZER}-{CELL.__name__}-seq-{N_STEPS}-step-{LOOKUP_STEP}-"    
+    f"{LOSS}-{OPTIMIZER}-{CELL.__name__}-seq-{N_STEPS}-step-{LOOKUP_STEP}-"
     f"layers-{N_LAYERS}-units-{UNITS}"
 )
 if BIDIRECTIONAL:
