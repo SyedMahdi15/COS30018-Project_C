@@ -1,125 +1,131 @@
-import os
-import glob
+import os, sys
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
+import matplotlib.pyplot as plt
+from stock_predictionJJ import create_model, load_data
+from parameters import *
+import os
 import tensorflow as tf
+print(tf.__version__)
+print(tf.config.list_physical_devices('GPU'))  
+from tensorflow.keras.callbacks import EarlyStopping 
 
-from stock_predictionJJ import (
-    TICKER, START_DATE, END_DATE, PERIOD, NA_STRATEGY, INTERVAL,
-    N_STEPS, LOOKUP_STEP, SCALE, SPLIT_BY_DATE, SHUFFLE, TEST_SIZE,
-    FEATURE_COLUMNS, N_LAYERS, CELL, UNITS, DROPOUT, BIDIRECTIONAL,
-    LOSS, LOSS_NAME, OPTIMIZER,
-    RESULTS_DIR, LOGS_DIR, DATA_DIR, CSV_RESULTS_DIR, DATE_NOW,
-    MODEL_NAME, load_data, create_model, get_final_df, predict_future, plot_graph
-)
 
-def _load_best_weights(model):
-    exact = os.path.join(RESULTS_DIR, MODEL_NAME + ".weights.h5")
-    if os.path.exists(exact):
-        model.load_weights(exact)
-        print(f"[evaluate] Loaded weights: {exact}")
-        return
+def plot_graph(test_df):
+    """
+    This function plots true close price along with predicted close price
+    with blue and red colors respectively
+    """
+    plt.plot(test_df[f'true_adjclose_{LOOKUP_STEP}'], c='b')
+    plt.plot(test_df[f'adjclose_{LOOKUP_STEP}'], c='r')
+    plt.xlabel("Days")
+    plt.ylabel("Price")
+    plt.legend(["Actual Price", "Predicted Price"])
+    plt.show()
 
-    # 2) latest_<TICKER>.weights.h5 (if training saved a copy)
-    latest_by_ticker = os.path.join(RESULTS_DIR, f"latest_{TICKER}.weights.h5")
-    if os.path.exists(latest_by_ticker):
-        model.load_weights(latest_by_ticker)
-        print(f"[evaluate] Loaded weights: {latest_by_ticker}")
-        return
 
-    # 3) LATEST_RUN.txt → contains last MODEL_NAME used
-    latest_run_txt = os.path.join(RESULTS_DIR, "LATEST_RUN.txt")
-    if os.path.exists(latest_run_txt):
-        with open(latest_run_txt, "r") as f:
-            last_model_name = f.read().strip()
-        candidate = os.path.join(RESULTS_DIR, last_model_name + ".weights.h5")
-        if os.path.exists(candidate):
-            model.load_weights(candidate)
-            print(f"[evaluate] Loaded weights: {candidate}")
-            return
+def get_final_df(model, data):
+    """
+    This function takes the `model` and `data` dict to
+    construct a final dataframe that includes the features along
+    with true and predicted prices of the testing dataset
+    """
+   
+    buy_profit  = lambda current, pred_future, true_future: true_future - current if pred_future > current else 0
+    sell_profit = lambda current, pred_future, true_future: current - true_future if pred_future < current else 0
+    X_test = data["X_test"]
+    y_test = data["y_test"]
 
-    # 4) Fallback: pick most recent weights for this ticker
-    pattern = os.path.join(RESULTS_DIR, f"*_{TICKER}-*.weights.h5")
-    matches = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
-    if matches:
-        model.load_weights(matches[0])
-        print(f"[evaluate] Loaded weights: {matches[0]}")
-        return
-
-    raise FileNotFoundError(
-        f"Could not find any weights for ticker {TICKER}. "
-        f"Tried: {exact}, {latest_by_ticker}, LATEST_RUN.txt, and pattern {pattern}."
-    )
-
-def main():
-    print(f"[evaluate] Loading data for ticker: {TICKER}")
-
-    data = load_data(
-        TICKER,
-        N_STEPS,
-        scale=SCALE,
-        split_by_date=SPLIT_BY_DATE,
-        shuffle=SHUFFLE,
-        lookup_step=LOOKUP_STEP,
-        test_size=TEST_SIZE,
-        feature_columns=FEATURE_COLUMNS,
-        start_date=START_DATE,
-        end_date=END_DATE,
-        period=PERIOD,
-        cache_path=None,         # or point to a specific cached CSV if you prefer
-        use_local=True,
-        na_strategy=NA_STRATEGY
-    )
-
-    model = create_model(
-        N_STEPS,
-        len(FEATURE_COLUMNS),
-        loss=LOSS,               # same loss object as training
-        units=UNITS,
-        cell=CELL,
-        n_layers=N_LAYERS,
-        dropout=DROPOUT,
-        optimizer=OPTIMIZER,
-        bidirectional=BIDIRECTIONAL,
-    )
-
-    _load_best_weights(model)
-
-    # Evaluate
-    loss_val, mae = model.evaluate(data["X_test"], data["y_test"], verbose=0)
+    # perform prediction and get prices
+    y_pred = model.predict(X_test)
     if SCALE:
-        mean_absolute_error = data["column_scaler"]["adjclose"].inverse_transform([[mae]])[0][0]
+        y_test = np.squeeze(data["column_scaler"]["adjclose"].inverse_transform(np.expand_dims(y_test, axis=0)))
+        y_pred = np.squeeze(data["column_scaler"]["adjclose"].inverse_transform(y_pred))
+    test_df = data["test_df"]
+    # add predicted future prices to the dataframe
+    test_df[f"adjclose_{LOOKUP_STEP}"] = y_pred
+    # add true future prices to the dataframe
+    test_df[f"true_adjclose_{LOOKUP_STEP}"] = y_test
+    # sort the dataframe by date
+    test_df.sort_index(inplace=True)
+    final_df = test_df
+    # add the buy profit column
+    final_df["buy_profit"] = list(map(buy_profit,
+                                    final_df["adjclose"],
+                                    final_df[f"adjclose_{LOOKUP_STEP}"],
+                                    final_df[f"true_adjclose_{LOOKUP_STEP}"])
+                                   
+                                    )
+    final_df["sell_profit"] = list(map(sell_profit,
+                                    final_df["adjclose"],
+                                    final_df[f"adjclose_{LOOKUP_STEP}"],
+                                    final_df[f"true_adjclose_{LOOKUP_STEP}"])
+                                    )
+    return final_df
+def predict(model, data):
+    # retrieve the last sequence from data
+    last_sequence = data["last_sequence"][-N_STEPS:]
+    # expand dimension
+    last_sequence = np.expand_dims(last_sequence, axis=0)
+    # get the prediction (scaled from 0 to 1)
+    prediction = model.predict(last_sequence)
+    # get the price (by inverting the scaling)
+    if SCALE:
+        predicted_price = data["column_scaler"]["adjclose"].inverse_transform(prediction)[0][0]
     else:
-        mean_absolute_error = mae
+        predicted_price = prediction[0][0]
+    return predicted_price
 
-    # Final df + metrics
-    final_df = get_final_df(model, data, scale=SCALE, lookup_step=LOOKUP_STEP)
-    future_price = predict_future(model, data, N_STEPS, scale=SCALE)
 
-    accuracy_score = (
-        (final_df["sell_profit"] > 0).sum() + (final_df["buy_profit"] > 0).sum()
-    ) / len(final_df)
-    total_buy_profit = final_df["buy_profit"].sum()
-    total_sell_profit = final_df["sell_profit"].sum()
-    total_profit = total_buy_profit + total_sell_profit
-    profit_per_trade = total_profit / len(final_df)
+# load the data
+data = load_data(ticker, N_STEPS, scale=SCALE, split_by_date=SPLIT_BY_DATE,
+                shuffle=SHUFFLE, lookup_step=LOOKUP_STEP, test_size=TEST_SIZE,
+                feature_columns=FEATURE_COLUMNS)
 
-    print("\n=== Evaluation Summary ===")
-    print(f"Ticker: {TICKER}")
-    print(f"Predicted price after {LOOKUP_STEP} days: {future_price:.2f}")
-    print(f"{LOSS_NAME} loss (val): {loss_val:.6f}")
-    print(f"Mean Absolute Error (inverse scaled): {mean_absolute_error:.4f}")
-    print(f"Accuracy score: {accuracy_score:.4f}")
-    print(f"Total buy profit: {total_buy_profit:.2f}")
-    print(f"Total sell profit: {total_sell_profit:.2f}")
-    print(f"Total profit: {total_profit:.2f}")
-    print(f"Profit per trade: {profit_per_trade:.4f}")
+# construct the model
+model = create_model(N_STEPS, len(FEATURE_COLUMNS), loss=LOSS, units=UNITS, cell=CELL, n_layers=N_LAYERS,
+                    dropout=DROPOUT, optimizer=OPTIMIZER, bidirectional=BIDIRECTIONAL)
 
-    # Plot Actual vs Predicted
-    plot_graph(final_df, LOOKUP_STEP)
+# load optimal model weights from results folder
+model_path = os.path.join("results", model_name) + ".h5"
+model.load_weights(model_path)
 
-    csv_out = os.path.join(CSV_RESULTS_DIR, MODEL_NAME + "_eval.csv")
-    final_df.to_csv(csv_out, index=True)
-    print(f"[evaluate] Saved evaluation CSV to {csv_out}")
+# evaluate the model
+loss, mae = model.evaluate(data["X_test"], data["y_test"], verbose=0)
+# calculate the mean absolute error (inverse scaling)
+if SCALE:
+    mean_absolute_error = data["column_scaler"]["adjclose"].inverse_transform([[mae]])[0][0]
+else:
+    mean_absolute_error = mae
 
-if __name__ == "__main__":
-    main()
+# get the final dataframe for the testing set
+final_df = get_final_df(model, data)
+# predict the future price
+future_price = predict(model, data)
+# we calculate the accuracy by counting the number of positive profits
+accuracy_score = (len(final_df[final_df['sell_profit'] > 0]) + len(final_df[final_df['buy_profit'] > 0])) / len(final_df)
+# calculating total buy & sell profit
+total_buy_profit  = final_df["buy_profit"].sum()
+total_sell_profit = final_df["sell_profit"].sum()
+# total profit by adding sell & buy together
+total_profit = total_buy_profit + total_sell_profit
+# dividing total profit by number of testing samples (number of trades)
+profit_per_trade = total_profit / len(final_df)
+# printing metrics
+print(f"Future price after {LOOKUP_STEP} days is {future_price:.2f}$")
+print(f"{LOSS} loss:", loss)
+print("Mean Absolute Error:", mean_absolute_error)
+print("Accuracy score:", accuracy_score)
+print("Total buy profit:", total_buy_profit)
+print("Total sell profit:", total_sell_profit)
+print("Total profit:", total_profit)
+print("Profit per trade:", profit_per_trade)
+# plot true/pred prices graph
+plot_graph(final_df)
+print(final_df.tail(10))
+# save the final dataframe to csv-results folder
+csv_results_folder = "csv-results"
+if not os.path.isdir(csv_results_folder):
+    os.mkdir(csv_results_folder)
+csv_filename = os.path.join(csv_results_folder, model_name + ".csv")
+final_df.to_csv(csv_filename)
