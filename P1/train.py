@@ -1,4 +1,3 @@
-# train.py
 import os
 import shutil
 import tensorflow as tf
@@ -10,8 +9,6 @@ from parameters import *
 for folder in ["results", "logs", "data", "csv-results"]:
     os.makedirs(folder, exist_ok=True)
 
-# ---------- Config you’re overriding here ----------
-# If you want to force AAPL regardless of parameters.ticker:
 ticker_local = "AAPL"
 
 print(f"Loading data for ticker: {ticker_local}")
